@@ -14,7 +14,6 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/docker/pkg/term"
 )
 
@@ -31,12 +30,11 @@ type Streamer struct {
 	resp  types.HijackedResponse
 }
 
-func New(isTty bool) *Streamer {
+func New() *Streamer {
 	return &Streamer{
-		in:    NewIn(os.Stdin),
-		out:   NewOut(os.Stdout),
-		err:   os.Stderr,
-		isTty: isTty,
+		in:  NewIn(os.Stdin),
+		out: NewOut(os.Stdout),
+		err: os.Stderr,
 	}
 }
 
@@ -46,7 +44,7 @@ func (s *Streamer) Stream(ctx context.Context, cli *client.Client, id string) (e
 	}
 
 	s.resp, err = cli.ContainerExecAttach(ctx, id, types.ExecStartCheck{
-		Tty: s.isTty,
+		Tty: true,
 	})
 	if err != nil {
 		return err
@@ -60,7 +58,7 @@ func (s *Streamer) Stream(ctx context.Context, cli *client.Client, id string) (e
 		errCh <- s.stream(ctx)
 	}()
 
-	if s.isTty && s.in.IsTerminal {
+	if s.in.IsTerminal {
 		s.monitorTtySize(ctx, cli, id)
 	}
 
@@ -132,13 +130,9 @@ func (s *Streamer) streamOut(restore func()) <-chan error {
 	done := make(chan error, 1)
 
 	go func() {
-		var err error
-		if s.isTty {
-			_, err = io.Copy(s.out, s.resp.Reader)
-			restore()
-		} else {
-			_, err = stdcopy.StdCopy(s.out, s.err, s.resp.Reader)
-		}
+		_, err := io.Copy(s.out, s.resp.Reader)
+		restore()
+
 		if err != nil {
 			log.Printf("output stream error: %s", err)
 		}
