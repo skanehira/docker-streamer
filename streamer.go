@@ -93,11 +93,11 @@ func (s *Streamer) streamIn(restore func(), resp types.HijackedResponse) <-chan 
 	done := make(chan struct{})
 
 	go func() {
+		defer close(done)
 		_, err := io.Copy(resp.Conn, s.in)
 		restore()
 
 		if _, ok := err.(term.EscapeError); ok {
-			// TODO handling esape
 			return
 		}
 
@@ -109,7 +109,6 @@ func (s *Streamer) streamIn(restore func(), resp types.HijackedResponse) <-chan 
 			log.Printf("close response error: %s", err)
 		}
 
-		close(done)
 	}()
 
 	return done
