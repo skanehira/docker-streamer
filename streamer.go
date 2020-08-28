@@ -13,9 +13,10 @@ import (
 	"os/signal"
 
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/term"
 )
+
+type ResizeContainer func(ctx context.Context, id string, options types.ResizeOptions) error
 
 var (
 	ErrEmptyExecID   = errors.New("emtpy exec id")
@@ -27,7 +28,6 @@ type Streamer struct {
 	out   *Out
 	err   io.Writer
 	isTty bool
-	resp  types.HijackedResponse
 }
 
 func New() *Streamer {
@@ -38,28 +38,20 @@ func New() *Streamer {
 	}
 }
 
-func (s *Streamer) Stream(ctx context.Context, cli *client.Client, id string) (err error) {
+func (s *Streamer) Stream(ctx context.Context, id string, resp types.HijackedResponse, resize ResizeContainer) (err error) {
 	if id == "" {
 		return ErrEmptyExecID
 	}
-
-	s.resp, err = cli.ContainerExecAttach(ctx, id, types.ExecStartCheck{
-		Tty: true,
-	})
-	if err != nil {
-		return err
-	}
-	defer s.resp.Close()
 
 	errCh := make(chan error, 1)
 
 	go func() {
 		defer close(errCh)
-		errCh <- s.stream(ctx)
+		errCh <- s.stream(ctx, resp)
 	}()
 
 	if s.in.IsTerminal {
-		s.monitorTtySize(ctx, cli, id)
+		s.monitorTtySize(ctx, resize, id)
 	}
 
 	if err := <-errCh; err != nil {
@@ -70,7 +62,7 @@ func (s *Streamer) Stream(ctx context.Context, cli *client.Client, id string) (e
 	return nil
 }
 
-func (s *Streamer) stream(ctx context.Context) error {
+func (s *Streamer) stream(ctx context.Context, resp types.HijackedResponse) error {
 	// set raw mode
 	restore, err := s.SetRawTerminal()
 	if err != nil {
@@ -79,8 +71,8 @@ func (s *Streamer) stream(ctx context.Context) error {
 	defer restore()
 
 	// start stdin/stdout stream
-	outDone := s.streamOut(restore)
-	inDone, detached := s.streamIn(restore)
+	outDone := s.streamOut(restore, resp)
+	inDone := s.streamIn(restore, resp)
 
 	select {
 	case err := <-outDone:
@@ -92,23 +84,20 @@ func (s *Streamer) stream(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-	case err := <-detached:
-		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
-func (s *Streamer) streamIn(restore func()) (<-chan struct{}, <-chan error) {
+func (s *Streamer) streamIn(restore func(), resp types.HijackedResponse) <-chan struct{} {
 	done := make(chan struct{})
-	detached := make(chan error, 1)
 
 	go func() {
-		_, err := io.Copy(s.resp.Conn, s.in)
+		_, err := io.Copy(resp.Conn, s.in)
 		restore()
 
 		if _, ok := err.(term.EscapeError); ok {
-			detached <- err
+			// TODO handling esape
 			return
 		}
 
@@ -116,21 +105,21 @@ func (s *Streamer) streamIn(restore func()) (<-chan struct{}, <-chan error) {
 			log.Printf("in stream error: %s", err)
 		}
 
-		if err := s.resp.CloseWrite(); err != nil {
+		if err := resp.CloseWrite(); err != nil {
 			log.Printf("close response error: %s", err)
 		}
 
 		close(done)
 	}()
 
-	return done, detached
+	return done
 }
 
-func (s *Streamer) streamOut(restore func()) <-chan error {
+func (s *Streamer) streamOut(restore func(), resp types.HijackedResponse) <-chan error {
 	done := make(chan error, 1)
 
 	go func() {
-		_, err := io.Copy(s.out, s.resp.Reader)
+		_, err := io.Copy(s.out, resp.Reader)
 		restore()
 
 		if err != nil {
@@ -160,7 +149,7 @@ func (s *Streamer) SetRawTerminal() (func(), error) {
 	return restore, nil
 }
 
-func (s *Streamer) resizeTty(ctx context.Context, cli *client.Client, id string) error {
+func (s *Streamer) resizeTty(ctx context.Context, resize ResizeContainer, id string) error {
 	h, w := s.out.GetTtySize()
 	if h == 0 && w == 0 {
 		return ErrTtySizeIsZero
@@ -171,16 +160,16 @@ func (s *Streamer) resizeTty(ctx context.Context, cli *client.Client, id string)
 		Width:  w,
 	}
 
-	return cli.ContainerExecResize(ctx, id, options)
+	return resize(ctx, id, options)
 }
 
-func (s *Streamer) initTtySize(ctx context.Context, cli *client.Client, id string) {
-	if err := s.resizeTty(ctx, cli, id); err != nil {
+func (s *Streamer) initTtySize(ctx context.Context, resize ResizeContainer, id string) {
+	if err := s.resizeTty(ctx, resize, id); err != nil {
 		go func() {
 			log.Printf("failed to resize tty: %s\n", err)
 			for retry := 0; retry < 5; retry++ {
 				time.Sleep(10 * time.Millisecond)
-				if err = s.resizeTty(ctx, cli, id); err == nil {
+				if err = s.resizeTty(ctx, resize, id); err == nil {
 					break
 				}
 			}
@@ -191,13 +180,13 @@ func (s *Streamer) initTtySize(ctx context.Context, cli *client.Client, id strin
 	}
 }
 
-func (s *Streamer) monitorTtySize(ctx context.Context, cli *client.Client, id string) {
-	s.initTtySize(ctx, cli, id)
+func (s *Streamer) monitorTtySize(ctx context.Context, resize ResizeContainer, id string) {
+	s.initTtySize(ctx, resize, id)
 	sigchan := make(chan os.Signal, 1)
 	signal.Notify(sigchan, syscall.SIGWINCH)
 	go func() {
 		for range sigchan {
-			s.resizeTty(ctx, cli, id)
+			s.resizeTty(ctx, resize, id)
 		}
 	}()
 }
