@@ -103,7 +103,7 @@ func (s *Streamer) streamIn(restore func()) (<-chan struct{}, <-chan error) {
 	done := make(chan struct{})
 	detached := make(chan error, 1)
 
-	func() {
+	go func() {
 		_, err := io.Copy(s.resp.Conn, s.in)
 		restore()
 
