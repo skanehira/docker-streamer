@@ -17,9 +17,13 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if len(os.Args) != 2 {
+		log.Fatal("required container name")
+	}
+
 	ctx := context.Background()
 
-	response, err := cli.ContainerExecCreate(ctx, "golang", types.ExecConfig{
+	response, err := cli.ContainerExecCreate(ctx, os.Args[1], types.ExecConfig{
 		Tty:          true,
 		AttachStdin:  true,
 		AttachStderr: true,
